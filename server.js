@@ -10,10 +10,11 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { GoogleGenAI } from '@google/genai';
 import multer from 'multer';
-import pdfParseModule from 'pdf-parse';
+import { createRequire } from 'module';
 import { createServer as createViteServer } from 'vite';
 
-const pdfParse = pdfParseModule.default || pdfParseModule;
+const require = createRequire(import.meta.url);
+const pdfParse = require('pdf-parse');
 
 // MongoDB connection with fast timeout & in-memory fallback
 let isMongoConnected = false;

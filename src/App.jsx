@@ -1,9 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Trophy, Users, Play, Send, CheckCircle, FileText, UploadCloud, X, Sparkles, BookOpen, Lightbulb } from 'lucide-react';
+import { Trophy, Users, CheckCircle, FileText, UploadCloud, X, Sparkles, BookOpen, Lightbulb } from 'lucide-react';
 import socket from './socket';
-import { auth } from './firebase.config';
-import { onAuthStateChanged } from 'firebase/auth';
 import LoginPage from './components/LoginPage';
 import './index.css';
 
@@ -20,7 +18,6 @@ function App() {
   const [timer, setTimer] = useState(0);
   const [answersCount, setAnswersCount] = useState(0);
   const [status, setStatus] = useState('');
-  const [score, setScore] = useState(0);
   const [numQuestions, setNumQuestions] = useState(5);
   const [uploadedFileContent, setUploadedFileContent] = useState('');
   const [fileName, setFileName] = useState('');
@@ -226,12 +223,11 @@ function App() {
     setUploadedFileContent('');
 
     if (isPdf) {
-      // Upload PDF directly to Python backend — avoids Socket.IO 1MB limit
       setPdfExtracting(true);
       try {
         const formData = new FormData();
         formData.append('file', file);
-        const res = await fetch('http://127.0.0.1:8000/extract_pdf', {
+        const res = await fetch('/extract_pdf', {
           method: 'POST',
           body: formData,
         });
@@ -245,7 +241,7 @@ function App() {
         if (!aiTopic) setAiTopic(file.name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' '));
       } catch (err) {
         console.error('PDF extraction error:', err);
-        setPdfError(`Could not extract PDF: ${err.message}. Is the Python backend running on port 8000?`);
+        setPdfError(`Could not extract PDF: ${err.message}`);
         setFileName('');
       } finally {
         setPdfExtracting(false);
@@ -727,9 +723,6 @@ function App() {
                       <div className="podium-container" style={{ display: 'flex', alignItems: 'flex-end', gap: '1rem', height: '300px', marginBottom: '4rem' }}>
                         {[...players].sort((a,b) => b.score - a.score).slice(0, 5).map((p, i) => {
                           const heights = ['100%', '80%', '60%', '50%', '40%'];
-                          const order = [1, 0, 2, 3, 4]; // Center the 1st place
-                          const pOrdered = [...players].sort((a,b) => b.score - a.score).slice(0, 5);
-                          // We'll just show them in order for now as a clean list if podium is too complex
                           return (
                             <motion.div 
                               key={i}

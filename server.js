@@ -3,21 +3,41 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import admin from 'firebase-admin';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
+import path from 'path';
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { GoogleGenAI } from '@google/genai';
+import multer from 'multer';
+import pdfParseModule from 'pdf-parse';
+import { createServer as createViteServer } from 'vite';
 
-mongoose.connect('mongodb://127.0.0.1:27017/learntest_arena')
-  .then(() => console.log('MongoDB connected successfully.'))
-  .catch(err => console.error('MongoDB connection error:', err));
+const pdfParse = pdfParseModule.default || pdfParseModule;
+
+// MongoDB connection with fast timeout & in-memory fallback
+let isMongoConnected = false;
+const inMemoryUsers = new Map();
+const inMemoryMatches = [];
+
+mongoose.set('bufferCommands', false);
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/learntest_arena', {
+  serverSelectionTimeoutMS: 2000
+})
+  .then(() => {
+    isMongoConnected = true;
+    console.log('MongoDB connected successfully.');
+  })
+  .catch((_err) => {
+    console.warn('MongoDB not connected — in-memory fallback active for users and matches.');
+  });
 
 const matchSchema = new mongoose.Schema({
   pin: String,
   title: String,
   date: { type: Date, default: Date.now },
   players: Array,
-  questions: Array  // stores questions with explanations for audit/review
+  questions: Array
 });
 const Match = mongoose.model('Match', matchSchema);
 
@@ -27,35 +47,92 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 
+// Safe Firebase Admin initialization
 try {
-  const serviceAccount = JSON.parse(readFileSync('./serviceAccountKey.json', 'utf8'));
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-  console.log("Firebase Admin initialized successfully.");
+  if (existsSync('./serviceAccountKey.json')) {
+    const serviceAccount = JSON.parse(readFileSync('./serviceAccountKey.json', 'utf8'));
+    if (serviceAccount.project_id && !serviceAccount.project_id.includes('YOUR_PROJECT_ID')) {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+      console.log("Firebase Admin initialized successfully.");
+    } else {
+      console.log("Firebase Admin credentials are placeholder. Skipping Admin SDK initialization.");
+    }
+  }
 } catch (err) {
-  console.warn("Firebase Admin init failed. Check serviceAccountKey.json.", err.message);
+  console.warn("Firebase Admin init skipped/failed:", err.message);
 }
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-const JWT_SECRET = 'learntest-arena-super-secret-key';
+const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 
+const JWT_SECRET = process.env.JWT_SECRET || 'learntest-arena-super-secret-key';
+
+// PDF extraction route
+const handlePdfExtract = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ detail: "No file uploaded" });
+    }
+    const pdfBuffer = req.file.buffer;
+    const data = await pdfParse(pdfBuffer);
+    const fullText = data.text || '';
+    const text = fullText.slice(0, 15000);
+    console.log(`Extracted ${text.length} characters from uploaded PDF.`);
+    return res.json({
+      success: true,
+      text: text,
+      charCount: text.length,
+      estimatedPages: data.numpages || Math.max(1, Math.round(pdfBuffer.length / 35000))
+    });
+  } catch (err) {
+    console.error("PDF extract error:", err);
+    return res.status(500).json({ detail: "Failed to extract PDF: " + err.message });
+  }
+};
+
+app.post('/extract_pdf', upload.single('file'), handlePdfExtract);
+app.post('/api/extract_pdf', upload.single('file'), handlePdfExtract);
+
+// Authentication routes
 app.post('/api/register', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const existingUser = await User.findOne({ email });
-    if (existingUser) return res.status(400).json({ message: "User already exists" });
+    if (!email || !password) {
+      return res.status(400).json({ message: "Email and password are required" });
+    }
 
+    if (isMongoConnected) {
+      try {
+        const existingUser = await User.findOne({ email });
+        if (existingUser) return res.status(400).json({ message: "User already exists" });
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const newUser = new User({ email, password: hashedPassword });
+        await newUser.save();
+        
+        const token = jwt.sign({ email: newUser.email }, JWT_SECRET, { expiresIn: '2h' });
+        return res.status(201).json({ token, user: { email: newUser.email } });
+      } catch (mongoErr) {
+        console.warn("Mongo register failed, falling back to in-memory store:", mongoErr.message);
+      }
+    }
+
+    // In-memory fallback
+    if (inMemoryUsers.has(email)) {
+      return res.status(400).json({ message: "User already exists" });
+    }
     const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = new User({ email, password: hashedPassword });
-    await newUser.save();
-    
-    const token = jwt.sign({ email: newUser.email }, JWT_SECRET, { expiresIn: '2h' });
-    res.status(201).json({ token, user: { email: newUser.email } });
+    inMemoryUsers.set(email, { email, password: hashedPassword });
+
+    const token = jwt.sign({ email }, JWT_SECRET, { expiresIn: '2h' });
+    return res.status(201).json({ token, user: { email } });
   } catch (error) {
+    console.error("Register error:", error);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -63,7 +140,27 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email });
+    if (!email || !password) {
+      return res.status(400).json({ message: "Email and password are required" });
+    }
+
+    if (isMongoConnected) {
+      try {
+        const user = await User.findOne({ email });
+        if (user) {
+          const isMatch = await bcrypt.compare(password, user.password);
+          if (!isMatch) return res.status(400).json({ message: "Incorrect password" });
+
+          const token = jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: '2h' });
+          return res.status(200).json({ token, user: { email: user.email } });
+        }
+      } catch (mongoErr) {
+        console.warn("Mongo login query failed, falling back to in-memory store:", mongoErr.message);
+      }
+    }
+
+    // In-memory fallback
+    const user = inMemoryUsers.get(email);
     if (!user) return res.status(400).json({ message: "No user found with this email" });
 
     const isMatch = await bcrypt.compare(password, user.password);
@@ -72,17 +169,105 @@ app.post('/api/login', async (req, res) => {
     const token = jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: '2h' });
     res.status(200).json({ token, user: { email: user.email } });
   } catch (error) {
+    console.error("Login error:", error);
     res.status(500).json({ message: "Server error" });
   }
 });
 
+// Quiz generation function using Gemini API or fallback
+function generateMockQuiz(topic, numQuestions = 5) {
+  const count = Math.min(20, Math.max(1, parseInt(numQuestions) || 5));
+  const t = topic || 'Trivia Arena';
+  const mockQuestions = [];
+  for (let i = 0; i < count; i++) {
+    mockQuestions.push({
+      question: `Question ${i + 1}: What is a primary concept regarding ${t}?`,
+      options: [
+        `Core principle of ${t}`,
+        `Secondary hypothesis`,
+        `Historical misconception`,
+        `Unrelated theorem`
+      ],
+      answer: 0,
+      time: 20,
+      explanation: `Option 1 represents the foundational principle of ${t}. Review study notes for deeper understanding.`
+    });
+  }
+  return {
+    title: `${t} Quiz`,
+    questions: mockQuestions
+  };
+}
+
+async function generateQuiz(topic, numQuestions = 5, fileContent = '') {
+  const count = Math.min(20, Math.max(1, parseInt(numQuestions) || 5));
+  const safeTopic = topic ? topic.trim() : (fileContent ? 'Document Study' : 'General Trivia');
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (apiKey) {
+    try {
+      const ai = new GoogleGenAI({ apiKey });
+      const prompt = `Generate exactly ${count} multiple-choice trivia questions about the topic "${safeTopic}".
+${fileContent ? `Use the following context text if relevant:\n${fileContent.slice(0, 15000)}` : ''}
+
+Return strictly valid JSON with this structure:
+{
+  "title": "${safeTopic} Quiz",
+  "questions": [
+    {
+      "question": "Question text?",
+      "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
+      "answer": 0,
+      "time": 20,
+      "explanation": "A clear, friendly explanation (2-3 sentences) of why the correct answer is right. Use simple language suitable for students."
+    }
+  ]
+}
+Rules:
+- There MUST be exactly 4 options per question.
+- The "answer" field must be an integer (0, 1, 2, or 3) representing the index of the correct option.
+- The "explanation" field MUST be present for every question. Write it in simple, student-friendly language that explains WHY the correct answer is right.
+- Do not return any markdown blocks or backticks, just the raw JSON object.`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json'
+        }
+      });
+
+      let text = response.text ? response.text.trim() : '';
+      if (text.startsWith('```json')) {
+        text = text.replace(/^```json/, '').replace(/```$/, '').trim();
+      } else if (text.startsWith('```')) {
+        text = text.replace(/^```/, '').replace(/```$/, '').trim();
+      }
+
+      const parsed = JSON.parse(text);
+      if (parsed && Array.isArray(parsed.questions) && parsed.questions.length > 0) {
+        for (const q of parsed.questions) {
+          if (!q.time) q.time = 20;
+          if (!q.explanation) {
+            q.explanation = `Option ${(q.answer ?? 0) + 1} is correct.`;
+          }
+        }
+        return parsed;
+      }
+    } catch (geminiErr) {
+      console.warn("Gemini quiz generation failed, using fallback quiz:", geminiErr.message);
+    }
+  }
+
+  return generateMockQuiz(safeTopic, count);
+}
+
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
-  maxHttpBufferSize: 10 * 1024 * 1024  // 10MB — allows text content through socket
+  maxHttpBufferSize: 10 * 1024 * 1024
 });
 
-// Available quizzes removed as per user request (switch to AI generation only)
 const activeGames = {};
 
 function generatePIN() {
@@ -100,12 +285,14 @@ async function verifyToken(token) {
     return decoded;
   } catch (err) {
     try {
-      const decodedToken = await admin.auth().verifyIdToken(token);
-      return decodedToken;
-    } catch (error) {
-      console.error("Token verification failed:", err.message, error.message);
-      return null;
+      if (admin.apps && admin.apps.length > 0) {
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        return decodedToken;
+      }
+    } catch {
+      console.error("Token verification failed:", err.message);
     }
+    return null;
   }
 }
 
@@ -190,18 +377,29 @@ const advanceQuestion = (pin, io) => {
     const sortedPlayers = game.players.sort((a,b) => b.score - a.score);
     io.to(pin).emit('game_over', sortedPlayers);
     
-    try {
-      const newMatch = new Match({
-        pin: pin,
+    if (isMongoConnected) {
+      try {
+        const newMatch = new Match({
+          pin: pin,
+          title: game.title,
+          players: sortedPlayers,
+          questions: game.questions
+        });
+        newMatch.save()
+          .then(() => console.log(`Match ${pin} saved to MongoDB.`))
+          .catch(err => console.error(`Error saving match ${pin} to MongoDB:`, err.message));
+      } catch (error) {
+        console.error("MongoDB save exception:", error.message);
+      }
+    } else {
+      inMemoryMatches.push({
+        pin,
         title: game.title,
         players: sortedPlayers,
-        questions: game.questions  // persist questions with explanations
+        questions: game.questions,
+        date: new Date()
       });
-      newMatch.save()
-        .then(() => console.log(`Match ${pin} saved to MongoDB.`))
-        .catch(err => console.error(`Error saving match ${pin} to MongoDB:`, err));
-    } catch (error) {
-      console.error("MongoDB exception:", error);
+      console.log(`Match ${pin} recorded in memory.`);
     }
   }
 };
@@ -217,30 +415,21 @@ io.on('connection', (socket) => {
       return;
     }
     
-    console.log(`Generating AI quiz for topic: ${topic}, Count: ${numQuestions}`);
-    let generated;
+    console.log(`Generating quiz for topic: ${topic}, count: ${numQuestions}`);
     try {
-      const response = await fetch('http://127.0.0.1:8000/generate_quiz', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ topic, numQuestions, fileContent })
-      });
-      if (!response.ok) throw new Error("Python backend error");
-      generated = await response.json();
+      const generated = await generateQuiz(topic, numQuestions, fileContent);
+      socket.emit('quiz_preview_ready', generated);
     } catch (err) {
-      console.error("Failed to call Python backend:", err);
-      socket.emit('join_error', "Failed to generate AI quiz from backend.");
-      return;
+      console.error("Failed to generate quiz:", err);
+      socket.emit('join_error', "Failed to generate quiz: " + err.message);
     }
-    
-    socket.emit('quiz_preview_ready', generated);
   });
 
   socket.on('create_room_from_preview', async (generatedQuiz, token) => {
     const user = await verifyToken(token);
     if (!user) {
-        socket.emit('join_error', "Unauthorized.");
-        return;
+      socket.emit('join_error', "Unauthorized.");
+      return;
     }
     const pin = generatePIN();
     
@@ -304,8 +493,8 @@ io.on('connection', (socket) => {
       if (player) {
         const correct = game.questions[game.currentQuestion].answer === answerIndex;
         if (correct) {
-            const timeBonus = Math.floor((game.timer / (game.questions[game.currentQuestion].time || 20)) * 500);
-            player.score += 500 + timeBonus;
+          const timeBonus = Math.floor((game.timer / (game.questions[game.currentQuestion].time || 20)) * 500);
+          player.score += 500 + timeBonus;
         }
       }
       io.to(game.hostId).emit('answer_received', game.answersCount);
@@ -324,7 +513,26 @@ io.on('connection', (socket) => {
   });
 });
 
-const PORT = 3001;
-httpServer.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+// Vite middleware in dev, static files in production
+async function setupViteOrStatic() {
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.use((req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+}
+
+await setupViteOrStatic();
+
+const PORT = 3000;
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on http://0.0.0.0:${PORT}`);
 });

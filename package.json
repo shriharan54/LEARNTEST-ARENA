@@ -4,15 +4,14 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"npm run vite\" \"npm run server\" \"npm run python-backend\"",
-    "vite": "vite",
-    "server": "node server.js",
-    "python-backend": "cd python_backend && python main.py",
+    "dev": "node server.js",
     "build": "vite build",
+    "start": "node server.js",
     "lint": "eslint .",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@google/genai": "^2.22.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "express": "^5.2.1",
@@ -22,6 +21,8 @@
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^1.0.1",
     "mongoose": "^9.3.3",
+    "multer": "^2.4.0",
+    "pdf-parse": "^2.4.5",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "socket.io": "^4.8.3",

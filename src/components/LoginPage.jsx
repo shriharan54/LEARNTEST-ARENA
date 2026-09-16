@@ -1,6 +1,5 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { auth } from '../firebase.config';
 import './LoginPage.css';
 
 const LoginPage = ({ onLoginSuccess }) => {
@@ -22,7 +21,8 @@ const LoginPage = ({ onLoginSuccess }) => {
 
     try {
       const endpoint = isLoginMode ? '/api/login' : '/api/register';
-      const response = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3001'}${endpoint}`, {
+      const apiUrl = import.meta.env.VITE_API_URL || '';
+      const response = await fetch(`${apiUrl}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password })
@@ -32,7 +32,7 @@ const LoginPage = ({ onLoginSuccess }) => {
       const text = await response.text();
       try {
         data = JSON.parse(text);
-      } catch (err) {
+      } catch {
         throw new Error("Server response was not JSON. Please restart your terminal running `npm run dev` to load the new backend APIs!");
       }
       

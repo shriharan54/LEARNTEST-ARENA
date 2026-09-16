@@ -1,0 +1,6 @@
+{
+  "name": "LearnTest Arena",
+  "description": "Multi-user interactive quiz arena with AI question generation and real-time multiplayer competition.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
